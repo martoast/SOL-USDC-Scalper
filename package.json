@@ -1,0 +1,37 @@
+{
+  "name": "aitrader",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.29.0",
+    "@coral-xyz/borsh": "^0.32.1",
+    "@noble/hashes": "^2.0.1",
+    "@nuxtjs/tailwindcss": "^6.14.0",
+    "@solana/wallet-adapter-base": "^0.9.27",
+    "@solana/wallet-adapter-phantom": "^0.9.28",
+    "@solana/wallet-adapter-solflare": "^0.6.32",
+    "@solana/web3.js": "^1.98.4",
+    "@tailwindcss/aspect-ratio": "^0.4.2",
+    "@tailwindcss/forms": "^0.5.10",
+    "@tailwindcss/postcss": "^4.1.17",
+    "@tailwindcss/typography": "^0.5.19",
+    "buffer": "^6.0.3",
+    "nuxt": "^4.2.1",
+    "solana-wallets-vue": "^0.7.1",
+    "vite-plugin-node-polyfills": "^0.24.0",
+    "vue": "^3.5.24",
+    "vue-router": "^4.6.3",
+    "ws": "^8.18.3"
+  },
+  "packageManager": "yarn@1.22.19+sha1.4ba7fc5c6e704fce2066ecbfb0b0d8976fe62447",
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}
