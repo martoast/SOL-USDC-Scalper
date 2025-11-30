@@ -13,7 +13,7 @@ export interface Candle {
   close: number;
   volume: number;
   trades: number;
-  timestamp: number; // Period start time
+  timestamp: number;
 }
 
 export type Timeframe = '1s' | '1m' | '2m' | '5m' | '10m' | '30m' | '1h';
@@ -30,13 +30,13 @@ const TIMEFRAME_MS: Record<Timeframe, number> = {
 };
 
 const MAX_CANDLES: Record<Timeframe, number> = {
-  '1s': 120,  // 2 minutes of 1s candles
-  '1m': 60,   // 1 hour of 1m candles
-  '2m': 60,   // 2 hours of 2m candles
-  '5m': 60,   // 5 hours of 5m candles
-  '10m': 60,  // 10 hours of 10m candles
-  '30m': 48,  // 24 hours of 30m candles
-  '1h': 48,   // 48 hours of 1h candles
+  '1s': 120,
+  '1m': 60,
+  '2m': 60,
+  '5m': 60,
+  '10m': 60,
+  '30m': 48,
+  '1h': 48,
 };
 
 // === STATE ===
@@ -93,12 +93,9 @@ function updateTimeframe(
 
   let current = currentCandle[timeframe];
 
-  // Check if we need to close the current candle and start a new one
   if (current && current.timestamp !== periodStart) {
-    // Close current candle
     candles[timeframe].unshift(current);
 
-    // Trim to max size
     const maxCandles = MAX_CANDLES[timeframe];
     if (candles[timeframe].length > maxCandles) {
       candles[timeframe] = candles[timeframe].slice(0, maxCandles);
@@ -107,7 +104,6 @@ function updateTimeframe(
     current = null;
   }
 
-  // Create new candle if needed
   if (!current) {
     current = {
       open: price,
@@ -121,14 +117,13 @@ function updateTimeframe(
     currentCandle[timeframe] = current;
   }
 
-  // Update current candle
   current.high = Math.max(current.high, price);
   current.low = Math.min(current.low, price);
   current.close = price;
 
   if (isNewTrade) {
     current.trades += 1;
-    current.volume += 1; // We don't have actual volume, so count trades
+    current.volume += 1;
   }
 }
 
@@ -137,13 +132,11 @@ function updateTimeframe(
 export function getCandles(timeframe: Timeframe, limit: number = 50): Candle[] {
   const result: Candle[] = [];
 
-  // Add current candle first (most recent)
   const current = currentCandle[timeframe];
   if (current) {
     result.push(current);
   }
 
-  // Add closed candles
   result.push(...candles[timeframe].slice(0, limit - 1));
 
   return result;
@@ -186,7 +179,6 @@ export function getCandleStats(): {
 export function getPriceChange(timeframe: Timeframe): number {
   const candleList = getCandles(timeframe, 2);
   if (candleList.length < 2) {
-    // Use open vs close of current candle
     if (candleList.length === 1) {
       const c = candleList[0];
       return ((c.close - c.open) / c.open) * 100;

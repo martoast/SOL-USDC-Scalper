@@ -14,7 +14,6 @@ export default defineNuxtConfig({
     birdeyeApiKey: '', 
     geminiApiKey: '',
     heliusApiKey: '',
-    jupiterApiKey: '',
     
     // CLIENT SIDE KEYS
     public: {

@@ -2,6 +2,7 @@
 <script setup lang="ts">
 /**
  * SOL/USDC Scalper - Main Trading Dashboard
+ * Real-time WebSocket price engine
  */
 
 import { Buffer } from 'buffer';
@@ -55,6 +56,8 @@ interface TradeLog {
 const isAutoTrading = ref(false);
 const currentPosition = ref<Position | null>(null);
 const streamConnected = ref(false);
+const streamMode = ref<'websocket' | 'fallback'>('fallback');
+const avgLatency = ref(0);
 
 const priceData = ref({
   current: 0,
@@ -77,6 +80,16 @@ const streamStats = ref({
   pollCount: 0,
   errors: 0,
   swapsProcessed: 0,
+  websocket: {
+    connected: false,
+    messagesReceived: 0,
+    reconnects: 0,
+  },
+  pool: {
+    updatesReceived: 0,
+    priceChanges: 0,
+    avgLatency: 0,
+  },
 });
 
 const tradeLogs = ref<TradeLog[]>([]);
@@ -143,6 +156,11 @@ const currentCandle = computed(() => {
   return candleData.value.current[activeTimeframe.value] || null;
 });
 
+const connectionModeClass = computed(() => {
+  if (streamMode.value === 'websocket') return 'bg-green-500/20 text-green-400';
+  return 'bg-yellow-500/20 text-yellow-400';
+});
+
 const timeframes = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
 
 // === DATA FETCHING ===
@@ -153,17 +171,22 @@ const fetchData = async () => {
 
     if (json.success && json.data) {
       streamConnected.value = json.data.stream.connected;
+      streamMode.value = json.data.stream.mode || 'fallback';
+      avgLatency.value = json.data.price.avgLatency || 0;
+
       streamStats.value = {
         uptime: json.data.stream.uptime,
-        pollCount: json.data.stream.pollCount,
-        errors: json.data.stream.errors,
-        swapsProcessed: json.data.stream.swapsProcessed,
+        pollCount: json.data.stream.pool?.updatesReceived || 0,
+        errors: json.data.stream.websocket?.errors || 0,
+        swapsProcessed: json.data.stream.pool?.priceChanges || 0,
+        websocket: json.data.stream.websocket || {},
+        pool: json.data.stream.pool || {},
       };
 
       priceData.value = {
         current: json.data.price.current,
         change30s: json.data.price.change30s,
-        volume30s: json.data.price.volume30s,
+        volume30s: 0,
       };
 
       if (json.data.candles) {
@@ -181,10 +204,8 @@ const fetchPortfolio = async () => {
     const json = await res.json();
 
     if (json.success) {
-      // Update stats from persisted data
       stats.value = json.stats;
 
-      // Check for active position
       if (json.activeTrades && json.activeTrades.length > 0) {
         const active = json.activeTrades[0];
         currentPosition.value = {
@@ -198,7 +219,6 @@ const fetchPortfolio = async () => {
         };
       }
 
-      // Build trade logs from history
       if (json.history) {
         tradeLogs.value = json.history.map((t: any) => ({
           id: t.id,
@@ -279,7 +299,6 @@ const enterPosition = async () => {
   const usdAmount = positionSizeSol * price;
 
   try {
-    // Save to database
     const res = await fetch('/api/trade', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -327,7 +346,6 @@ const exitPosition = async (reason: string) => {
   const holdTime = (Date.now() - currentPosition.value.entryTime) / 1000;
 
   try {
-    // Save to database
     const res = await fetch('/api/trade', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -344,7 +362,6 @@ const exitPosition = async (reason: string) => {
     const json = await res.json();
 
     if (json.success) {
-      // Update local stats
       stats.value.totalTrades++;
       stats.value.totalPnL += pnl;
 
@@ -358,7 +375,6 @@ const exitPosition = async (reason: string) => {
         ? (stats.value.wins / stats.value.totalTrades) * 100
         : 0;
 
-      // Add to trade logs
       tradeLogs.value.unshift({
         id: currentPosition.value.id,
         timestamp: Date.now(),
@@ -379,8 +395,6 @@ const exitPosition = async (reason: string) => {
       );
 
       currentPosition.value = null;
-
-      // Refresh portfolio to get updated stats
       await fetchPortfolio();
     } else {
       log(`❌ Exit failed: ${json.error}`, 'error');
@@ -463,7 +477,7 @@ const getChangeClass = (change: number | undefined) => {
 onMounted(async () => {
   await fetchData();
   await fetchPortfolio();
-  dataTimer = setInterval(fetchData, 1000);
+  dataTimer = setInterval(fetchData, 500);
 });
 
 onUnmounted(() => {
@@ -483,11 +497,18 @@ onUnmounted(() => {
             :class="streamConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'"
           />
           <span class="font-bold">SOL/USDC Scalper</span>
+          <span
+            class="px-2 py-0.5 text-xs rounded-full font-medium"
+            :class="connectionModeClass"
+          >
+            {{ streamMode === 'websocket' ? '⚡ WS' : '🔄 Poll' }}
+          </span>
           <span v-if="settings.testMode" class="px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded-full">
-            TEST MODE
+            TEST
           </span>
         </div>
         <div class="flex items-center gap-4">
+          <span v-if="avgLatency > 0" class="text-xs text-green-400">{{ avgLatency }}ms</span>
           <span class="text-xs text-gray-400">{{ formatDuration(streamStats.uptime) }}</span>
           <button
             @click="showSettings = !showSettings"
@@ -500,7 +521,6 @@ onUnmounted(() => {
     </div>
 
     <div class="max-w-4xl mx-auto px-4 py-4 space-y-4">
-
       <!-- Price Card -->
       <div class="bg-gradient-to-br from-gray-900 to-gray-950 rounded-2xl p-5 border border-gray-800">
         <div class="flex items-start justify-between mb-3">
@@ -746,29 +766,31 @@ onUnmounted(() => {
             No logs yet
           </div>
           <div
-            v-for="log in consoleLogs"
-            :key="log.time"
+            v-for="logItem in consoleLogs"
+            :key="logItem.time"
             class="px-2 py-1 text-xs font-mono rounded"
             :class="{
-              'text-green-400': log.type === 'success',
-              'text-red-400': log.type === 'error',
-              'text-yellow-400': log.type === 'warn',
-              'text-gray-300': log.type === 'info',
+              'text-green-400': logItem.type === 'success',
+              'text-red-400': logItem.type === 'error',
+              'text-yellow-400': logItem.type === 'warn',
+              'text-gray-300': logItem.type === 'info',
             }"
           >
-            {{ log.message }}
+            {{ logItem.message }}
           </div>
         </div>
       </div>
 
-      <!-- Footer -->
-      <div class="flex items-center justify-center gap-6 text-xs text-gray-500 py-2">
+      <!-- Footer Stats -->
+      <div class="flex items-center justify-center gap-4 text-xs text-gray-500 py-2 flex-wrap">
         <div class="flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full" :class="streamConnected ? 'bg-green-500' : 'bg-red-500'"></span>
-          Jupiter API
+          {{ streamMode === 'websocket' ? 'WebSocket' : 'Polling' }}
         </div>
-        <div>{{ streamStats.swapsProcessed }} updates</div>
+        <div>{{ streamStats.pool.updatesReceived || 0 }} updates</div>
+        <div>{{ streamStats.pool.priceChanges || 0 }} changes</div>
         <div>{{ candleData.stats.totalCandles }} candles</div>
+        <div v-if="avgLatency > 0" class="text-green-400">~{{ avgLatency }}ms latency</div>
       </div>
     </div>
 
@@ -778,6 +800,22 @@ onUnmounted(() => {
         <div class="flex items-center justify-between mb-6">
           <h2 class="text-lg font-bold">⚙️ Settings</h2>
           <button @click="showSettings = false" class="text-gray-400 hover:text-white text-xl">✕</button>
+        </div>
+
+        <!-- Connection Info -->
+        <div class="mb-6 p-4 rounded-xl bg-gray-800">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-sm text-gray-400">Connection Mode</span>
+            <span
+              class="px-2 py-1 text-xs rounded-full font-medium"
+              :class="connectionModeClass"
+            >
+              {{ streamMode === 'websocket' ? '⚡ WebSocket' : '🔄 Polling' }}
+            </span>
+          </div>
+          <div v-if="avgLatency > 0" class="text-xs text-gray-500">
+            Average latency: <span class="text-green-400">{{ avgLatency }}ms</span>
+          </div>
         </div>
 
         <!-- Test Mode Toggle -->
