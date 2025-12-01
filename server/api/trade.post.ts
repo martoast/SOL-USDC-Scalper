@@ -1,70 +1,96 @@
 // server/api/trade.post.ts
 
-import { defineEventHandler, readBody } from 'h3'
-import { getDb, saveDb, type Trade } from '../utils/db'
+import { defineEventHandler, readBody } from 'h3';
+import { getDb, saveDb, type Trade } from '../utils/db';
 
 export default defineEventHandler(async (event) => {
-  const body = await readBody(event)
-  const { action, trade: tradeData } = body
+  const body = await readBody(event);
+  const { action, trade: tradeData, tradeId, exitPrice, pnl, pnlPercent, reason } = body;
 
-  const db = getDb()
+  const db = getDb();
 
   if (action === 'OPEN') {
+    const direction = tradeData.direction || 'LONG';
+    
     const newTrade: Trade = {
-      id: Math.random().toString(36).substring(7),
+      id: Math.random().toString(36).substring(2, 9),
       address: tradeData.address || 'SOL',
       symbol: tradeData.symbol || 'SOL/USDC',
       name: tradeData.name || 'Solana',
+      direction,
       entryPrice: tradeData.entryPrice,
       amount: tradeData.amount,
+      size: tradeData.size || tradeData.amount / tradeData.entryPrice,
       timestamp: tradeData.timestamp || Date.now(),
       status: 'OPEN',
-    }
+    };
 
-    db.activeTrades.push(newTrade)
-    saveDb(db)
+    db.activeTrades.push(newTrade);
+    saveDb(db);
 
-    console.log(`[Trade] Opened: ${newTrade.symbol} @ $${newTrade.entryPrice}`)
+    const emoji = direction === 'LONG' ? '🟢' : '🔴';
+    console.log(`[Trade] ${emoji} Opened ${direction}: ${newTrade.symbol} @ $${newTrade.entryPrice.toFixed(4)}`);
 
     return {
       success: true,
       trade: newTrade,
-      message: `Opened position: $${newTrade.amount} on ${newTrade.symbol}`,
-    }
+      message: `Opened ${direction} position: ${newTrade.size.toFixed(4)} SOL @ $${newTrade.entryPrice.toFixed(4)}`,
+    };
   }
 
   if (action === 'CLOSE') {
-    const { tradeId, exitPrice, pnl, pnlPercent, reason } = body
-
-    const tradeIndex = db.activeTrades.findIndex((t) => t.id === tradeId)
+    const tradeIndex = db.activeTrades.findIndex((t) => t.id === tradeId);
 
     if (tradeIndex === -1) {
-      return { success: false, error: 'Trade not found' }
+      return { success: false, error: 'Trade not found' };
     }
 
-    const trade = db.activeTrades[tradeIndex]
+    const trade = db.activeTrades[tradeIndex];
 
-    // Update trade with exit info
-    trade.exitPrice = exitPrice
-    trade.pnl = pnl
-    trade.status = 'CLOSED'
-    trade.closedAt = Date.now()
+    // Calculate P&L based on direction
+    let calculatedPnl = pnl;
+    let calculatedPnlPercent = pnlPercent;
+    
+    if (calculatedPnl === undefined) {
+      if (trade.direction === 'LONG') {
+        // LONG: profit when price goes UP
+        calculatedPnl = (exitPrice - trade.entryPrice) * trade.size;
+        calculatedPnlPercent = ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100;
+      } else {
+        // SHORT: profit when price goes DOWN
+        calculatedPnl = (trade.entryPrice - exitPrice) * trade.size;
+        calculatedPnlPercent = ((trade.entryPrice - exitPrice) / trade.entryPrice) * 100;
+      }
+    }
 
-    // Move from active to history
-    db.activeTrades.splice(tradeIndex, 1)
-    db.history.unshift(trade)
+    trade.exitPrice = exitPrice;
+    trade.pnl = calculatedPnl;
+    trade.pnlPercent = calculatedPnlPercent;
+    trade.status = 'CLOSED';
+    trade.closedAt = Date.now();
+    trade.exitReason = reason;
 
-    saveDb(db)
+    db.activeTrades.splice(tradeIndex, 1);
+    db.history.unshift(trade);
 
-    console.log(`[Trade] Closed: ${trade.symbol} | PnL: $${pnl?.toFixed(4)} (${reason})`)
+    saveDb(db);
+
+    const emoji = calculatedPnl >= 0 ? '🟢' : '🔴';
+    const dirEmoji = trade.direction === 'LONG' ? '📈' : '📉';
+    console.log(
+      `[Trade] ${emoji} Closed ${trade.direction} ${dirEmoji}: ${trade.symbol} | ` +
+      `PnL: $${calculatedPnl.toFixed(4)} (${calculatedPnlPercent >= 0 ? '+' : ''}${calculatedPnlPercent.toFixed(2)}%) | ` +
+      `${reason}`
+    );
 
     return {
       success: true,
       trade,
-      pnl,
-      message: `Closed ${trade.symbol}. PnL: $${pnl?.toFixed(4)}`,
-    }
+      pnl: calculatedPnl,
+      pnlPercent: calculatedPnlPercent,
+      message: `Closed ${trade.direction}. PnL: $${calculatedPnl.toFixed(4)}`,
+    };
   }
 
-  return { success: false, error: 'Invalid action' }
-})
+  return { success: false, error: 'Invalid action' };
+});

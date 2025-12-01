@@ -1,90 +1,89 @@
-import fs from 'node:fs'
-import path from 'node:path'
+// server/utils/db.ts
 
-// Define the structure of our Trade
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+
+const DB_PATH = join(process.cwd(), 'data', 'trades.json');
+
+// Limits
+const MAX_ACTIVE_TRADES = 10;
+const MAX_HISTORY_TRADES = 1000;
+
 export interface Trade {
   id: string;
-  address: string; // Crucial for tracking
+  address: string;
   symbol: string;
   name: string;
-  logoURI?: string;
+  direction: 'LONG' | 'SHORT'; // NEW: Trade direction
   entryPrice: number;
-  amount: number;
-  timestamp: number;
-  status: 'OPEN' | 'CLOSED';
-
-  // Fee Tracking (for devnet simulation)
-  entryFees?: number;      // Fees paid when opening position
-  exitFees?: number;       // Fees paid when closing position
-  totalFees?: number;      // Total fees paid (entry + exit)
-
-  // Live Data (Not saved to DB, but useful type definition)
-  currentPrice?: number;
-  currentValue?: number;
-  pnlPercent?: number;
-
-  // Exit Data (Saved when closed)
   exitPrice?: number;
+  amount: number;
+  size: number; // SOL amount
   pnl?: number;
+  pnlPercent?: number;
+  timestamp: number;
   closedAt?: number;
+  status: 'OPEN' | 'CLOSED';
+  exitReason?: string;
 }
 
-// Define the DB Structure
-interface Database {
+export interface Database {
   activeTrades: Trade[];
   history: Trade[];
 }
 
-// File Path (Saved in the root of your project)
-const DB_DIR = path.resolve(process.cwd(), 'data')
-const DB_PATH = path.join(DB_DIR, 'trades.json')
+const defaultDb: Database = {
+  activeTrades: [],
+  history: [],
+};
 
-// Ensure file and directory exist
-const initDb = () => {
+export function getDb(): Database {
   try {
-    // 1. Ensure Directory Exists
-    if (!fs.existsSync(DB_DIR)) {
-      fs.mkdirSync(DB_DIR, { recursive: true })
-      console.log('📁 Created data directory')
+    if (!existsSync(DB_PATH)) {
+      const dir = dirname(DB_PATH);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      saveDb(defaultDb);
+      return defaultDb;
     }
-
-    // 2. Ensure JSON File Exists
-    if (!fs.existsSync(DB_PATH)) {
-      const initialData: Database = { activeTrades: [], history: [] }
-      fs.writeFileSync(DB_PATH, JSON.stringify(initialData, null, 2))
-      console.log('📄 Created trades.json database')
-    }
+    const data = readFileSync(DB_PATH, 'utf-8');
+    return JSON.parse(data);
   } catch (e) {
-    console.error('❌ Failed to initialize database:', e)
+    console.error('[DB] Error reading database:', e);
+    return defaultDb;
   }
 }
 
-// Read Data (Safe Read)
-export const getDb = (): Database => {
-  initDb() // Always ensure it exists before reading
+export function saveDb(db: Database): void {
+  try {
+    db.activeTrades = db.activeTrades.slice(0, MAX_ACTIVE_TRADES);
+    db.history = db.history.slice(0, MAX_HISTORY_TRADES);
+    
+    const dir = dirname(DB_PATH);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    
+    writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  } catch (e) {
+    console.error('[DB] Error saving database:', e);
+  }
+}
+
+export function getDbStats() {
+  const db = getDb();
   
-  try {
-    const data = fs.readFileSync(DB_PATH, 'utf-8')
-    
-    // Handle empty file case
-    if (!data.trim()) {
-      return { activeTrades: [], history: [] }
-    }
-    
-    return JSON.parse(data)
-  } catch (e) {
-    console.error("⚠️ Database corruption or read error. Returning empty state.", e)
-    // Fallback to empty state so app doesn't crash
-    return { activeTrades: [], history: [] }
-  }
-}
-
-// Write Data (Safe Write)
-export const saveDb = (data: Database) => {
-  try {
-    initDb() // Ensure folder exists before writing
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2))
-  } catch (e) {
-    console.error("❌ Failed to save database:", e)
-  }
+  const longs = db.history.filter(t => t.direction === 'LONG');
+  const shorts = db.history.filter(t => t.direction === 'SHORT');
+  
+  return {
+    activeTrades: db.activeTrades.length,
+    historyTrades: db.history.length,
+    maxHistory: MAX_HISTORY_TRADES,
+    longs: longs.length,
+    shorts: shorts.length,
+    longWins: longs.filter(t => (t.pnl || 0) > 0).length,
+    shortWins: shorts.filter(t => (t.pnl || 0) > 0).length,
+  };
 }

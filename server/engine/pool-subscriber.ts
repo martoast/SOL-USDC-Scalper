@@ -11,13 +11,15 @@ import { WSConnection } from './ws-connection';
 import { parseClmmPool, validatePrice, SOL_USDC_POOL } from './raydium-clmm-parser';
 import { eventBus, EVENTS, type PriceUpdate } from './event-bus';
 
+// Constants
+const MAX_PRICE_HISTORY = 100; // Only keep 100 price points for 30s calc
+
 export class PoolSubscriber {
   private wsConnection: WSConnection;
   private lastPrice = 0;
   private lastUpdateTime = 0;
   private priceHistory: { price: number; time: number }[] = [];
   
-  // Stats
   private stats = {
     updatesReceived: 0,
     priceChanges: 0,
@@ -32,16 +34,11 @@ export class PoolSubscriber {
     this.setupListeners();
   }
 
-  /**
-   * Setup event listeners
-   */
   private setupListeners(): void {
-    // Listen for account updates from WebSocket
     eventBus.on('account:update', (data) => {
       this.handleAccountUpdate(data);
     });
 
-    // Listen for connection status changes
     eventBus.on(EVENTS.CONNECTION_STATUS, ({ connected }) => {
       if (connected) {
         this.subscribe();
@@ -49,22 +46,15 @@ export class PoolSubscriber {
     });
   }
 
-  /**
-   * Subscribe to pool account
-   */
   async subscribe(): Promise<boolean> {
     console.log(`[PoolSubscriber] Subscribing to pool: ${SOL_USDC_POOL.slice(0, 8)}...`);
     return this.wsConnection.subscribeToAccount(SOL_USDC_POOL);
   }
 
-  /**
-   * Handle incoming account update
-   */
   private handleAccountUpdate(update: { data: Buffer; slot: number; timestamp: number }): void {
     this.stats.updatesReceived++;
     const receiveTime = Date.now();
 
-    // Parse pool data
     const poolState = parseClmmPool(update.data);
     
     if (!poolState) {
@@ -72,18 +62,15 @@ export class PoolSubscriber {
       return;
     }
 
-    // Validate price
     if (!validatePrice(poolState.price)) {
       console.warn(`[PoolSubscriber] Invalid price: ${poolState.price}`);
       return;
     }
 
-    // Calculate latency (time from slot to now is approximate)
     const latency = receiveTime - update.timestamp;
 
-    // Check if price actually changed
     const priceChanged = this.lastPrice > 0 && 
-      Math.abs(poolState.price - this.lastPrice) / this.lastPrice > 0.000001; // 0.0001% threshold
+      Math.abs(poolState.price - this.lastPrice) / this.lastPrice > 0.000001;
 
     if (priceChanged) {
       this.stats.priceChanges++;
@@ -98,20 +85,25 @@ export class PoolSubscriber {
       );
     }
 
-    // Update tracking
     this.lastPrice = poolState.price;
     this.lastUpdateTime = receiveTime;
     this.stats.lastPrice = poolState.price;
     this.stats.lastUpdateTime = receiveTime;
-    
-    // Track latency average
     this.stats.avgLatency = this.stats.avgLatency * 0.9 + latency * 0.1;
 
-    // Track price history for 30s change calculation
-    this.priceHistory.push({ price: poolState.price, time: receiveTime });
-    this.priceHistory = this.priceHistory.filter(p => p.time > receiveTime - 30000);
+    // Track price history - WITH TRIMMING
+    const now = receiveTime;
+    this.priceHistory.push({ price: poolState.price, time: now });
+    
+    // Remove old entries (older than 60 seconds)
+    const cutoff = now - 60000;
+    this.priceHistory = this.priceHistory.filter(p => p.time > cutoff);
+    
+    // Also enforce max length as safety
+    if (this.priceHistory.length > MAX_PRICE_HISTORY) {
+      this.priceHistory = this.priceHistory.slice(-MAX_PRICE_HISTORY);
+    }
 
-    // Emit price update event
     const priceUpdate: PriceUpdate = {
       price: poolState.price,
       timestamp: receiveTime,
@@ -122,28 +114,31 @@ export class PoolSubscriber {
     eventBus.emit(EVENTS.PRICE_UPDATE, priceUpdate);
   }
 
-  /**
-   * Get 30-second price change
-   */
   getPriceChange30s(): number {
     if (this.priceHistory.length < 2) return 0;
     
-    const oldest = this.priceHistory[0];
+    const now = Date.now();
+    const thirtySecondsAgo = now - 30000;
+    
+    // Find oldest price within 30s window
+    const oldPrices = this.priceHistory.filter(p => p.time <= thirtySecondsAgo + 5000);
+    if (oldPrices.length === 0) {
+      // Use oldest available
+      const oldest = this.priceHistory[0];
+      const newest = this.priceHistory[this.priceHistory.length - 1];
+      return ((newest.price - oldest.price) / oldest.price) * 100;
+    }
+    
+    const oldest = oldPrices[oldPrices.length - 1];
     const newest = this.priceHistory[this.priceHistory.length - 1];
     
     return ((newest.price - oldest.price) / oldest.price) * 100;
   }
 
-  /**
-   * Get current price
-   */
   getCurrentPrice(): number {
     return this.lastPrice;
   }
 
-  /**
-   * Get stats
-   */
   getStats() {
     return {
       ...this.stats,

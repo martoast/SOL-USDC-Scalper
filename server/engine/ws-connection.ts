@@ -4,7 +4,9 @@
  * Helius WebSocket Connection Manager
  * 
  * Maintains persistent WebSocket connection to Helius
- * Handles reconnection, heartbeat, and message routing
+ * Handles reconnection, heartbeat, cleanup, and message routing
+ * 
+ * Designed for 24/7 operation
  */
 
 import WebSocket from 'ws';
@@ -23,6 +25,7 @@ export class WSConnection {
   private reconnectAttempts = 0;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private cleanupTimer: NodeJS.Timeout | null = null;
   private isConnecting = false;
   private shouldReconnect = true;
   private subscriptionId: number | null = null;
@@ -42,7 +45,7 @@ export class WSConnection {
   constructor(config: WSConnectionConfig) {
     this.config = {
       heliusApiKey: config.heliusApiKey,
-      maxReconnectAttempts: config.maxReconnectAttempts ?? 10,
+      maxReconnectAttempts: config.maxReconnectAttempts ?? 100,
       reconnectDelayMs: config.reconnectDelayMs ?? 5000,
       heartbeatIntervalMs: config.heartbeatIntervalMs ?? 30000,
     };
@@ -75,6 +78,7 @@ export class WSConnection {
           this.reconnectAttempts = 0;
           this.stats.connected = true;
           this.startHeartbeat();
+          this.startCleanup();
           eventBus.emit(EVENTS.CONNECTION_STATUS, { connected: true });
           resolve(true);
         });
@@ -121,6 +125,7 @@ export class WSConnection {
     console.log('[WSConnection] Disconnecting...');
     this.shouldReconnect = false;
     this.stopHeartbeat();
+    this.stopCleanup();
     
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -134,6 +139,7 @@ export class WSConnection {
 
     this.stats.connected = false;
     this.subscriptionId = null;
+    this.pendingRequests.clear();
     eventBus.emit(EVENTS.CONNECTION_STATUS, { connected: false });
   }
 
@@ -162,7 +168,15 @@ export class WSConnection {
     };
 
     return new Promise((resolve) => {
+      // Timeout for subscription
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        console.error('[WSConnection] Subscribe timeout');
+        resolve(false);
+      }, 10000);
+
       this.pendingRequests.set(id, (result) => {
+        clearTimeout(timeout);
         if (result.error) {
           console.error('[WSConnection] Subscribe error:', result.error);
           resolve(false);
@@ -190,7 +204,7 @@ export class WSConnection {
       if (message.id && this.pendingRequests.has(message.id)) {
         const callback = this.pendingRequests.get(message.id)!;
         this.pendingRequests.delete(message.id);
-        callback(message.result ?? message.error);
+        callback(message.result ?? { error: message.error });
         return;
       }
 
@@ -218,20 +232,27 @@ export class WSConnection {
   private handleDisconnect(): void {
     this.stats.connected = false;
     this.stopHeartbeat();
+    this.stopCleanup();
+    this.subscriptionId = null;
     eventBus.emit(EVENTS.CONNECTION_STATUS, { connected: false });
 
     if (this.shouldReconnect && this.reconnectAttempts < this.config.maxReconnectAttempts) {
       this.reconnectAttempts++;
       this.stats.reconnects++;
       
-      const delay = this.config.reconnectDelayMs * Math.min(this.reconnectAttempts, 5);
-      console.log(`[WSConnection] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`);
+      // Exponential backoff with max of 30 seconds
+      const delay = Math.min(
+        this.config.reconnectDelayMs * Math.pow(1.5, this.reconnectAttempts - 1),
+        30000
+      );
+      
+      console.log(`[WSConnection] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})...`);
 
       this.reconnectTimer = setTimeout(() => {
         this.connect();
       }, delay);
     } else if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-      console.error('[WSConnection] Max reconnect attempts reached');
+      console.error('[WSConnection] Max reconnect attempts reached - giving up');
       eventBus.emit(EVENTS.ENGINE_ERROR, { type: 'max_reconnects' });
     }
   }
@@ -244,13 +265,19 @@ export class WSConnection {
     
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        // Send a simple ping via a getHealth request
         const id = this.messageId++;
+        
+        // Send getHealth as heartbeat
         this.ws.send(JSON.stringify({
           jsonrpc: '2.0',
           id,
           method: 'getHealth',
         }));
+
+        // Clean up this request after 5 seconds if no response
+        setTimeout(() => {
+          this.pendingRequests.delete(id);
+        }, 5000);
       }
     }, this.config.heartbeatIntervalMs);
   }
@@ -263,6 +290,28 @@ export class WSConnection {
   }
 
   /**
+   * Periodic cleanup of stale pending requests
+   */
+  private startCleanup(): void {
+    this.stopCleanup();
+    
+    // Every 5 minutes, clean up old pending requests
+    this.cleanupTimer = setInterval(() => {
+      if (this.pendingRequests.size > 50) {
+        console.warn(`[WSConnection] Clearing ${this.pendingRequests.size} stale pending requests`);
+        this.pendingRequests.clear();
+      }
+    }, 5 * 60 * 1000);
+  }
+
+  private stopCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  /**
    * Get connection stats
    */
   getStats() {
@@ -270,6 +319,7 @@ export class WSConnection {
       ...this.stats,
       uptime: this.stats.startedAt ? Date.now() - this.stats.startedAt : 0,
       subscriptionActive: this.subscriptionId !== null,
+      pendingRequests: this.pendingRequests.size,
     };
   }
 
@@ -277,6 +327,6 @@ export class WSConnection {
    * Check if connected
    */
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.ws?.readyState === WebSocket.OPEN && this.stats.connected;
   }
 }
