@@ -54,6 +54,61 @@ interface TradeLog {
   reason?: string;
 }
 
+interface StrategySignal {
+  // Tradability gate status
+  tradability: {
+    isTradable: boolean;
+    reason: string | null;
+    checks: {
+      volatility: { passed: boolean; value: number | null };
+      trendStrength: { passed: boolean; value: number | null };
+      rangeCompression: { passed: boolean; value: number | null };
+    };
+  };
+  // Throttle status
+  throttle: {
+    canTrade: boolean;
+    reason: string | null;
+    cooldownRemaining: number;
+    tradesThisHour: number;
+    maxTradesPerHour: number;
+    consecutiveLosses: number;
+  };
+  // Entry confirmation status
+  entryConfirmation: {
+    confirmed: boolean;
+    reason: string | null;
+    checks: {
+      rangeCheck: { passed: boolean };
+      momentumCheck: { passed: boolean };
+      exhaustionCheck: { passed: boolean };
+    };
+  } | null;
+  regime: {
+    regime: string;
+    confidence: number;
+    recommendation: string;
+  };
+  entry: {
+    shouldEnter: boolean;
+    direction: 'LONG' | 'SHORT' | 'NONE';
+    confidence: number;
+    score: number;
+    suggestedStopLoss: number;
+    suggestedTakeProfit: number;
+    reasons: string[];
+    warnings: string[];
+  };
+  exit: {
+    shouldExit: boolean;
+    reason: string;
+    urgency: string;
+    trailingStopPrice: number | null;
+    currentPnLPercent: number;
+    explanation: string;
+  } | null;
+}
+
 // === STATE ===
 const isAutoTrading = ref(false);
 const currentPosition = ref<Position | null>(null);
@@ -61,6 +116,15 @@ const streamConnected = ref(false);
 const streamMode = ref<'websocket' | 'fallback'>('websocket');
 const avgLatency = ref(0);
 const detectedTrend = ref<'BULLISH' | 'BEARISH' | 'NEUTRAL'>('NEUTRAL');
+
+// Frontend trend hysteresis (prevent flickering)
+let confirmedTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+let pendingTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+let pendingTrendCount = 0;
+const TREND_STABILITY_REQUIRED = 3; // Need 3 consecutive signals to switch
+
+// Strategy state
+const strategySignal = ref<StrategySignal | null>(null);
 
 const priceData = ref({
   current: 0,
@@ -91,8 +155,11 @@ const stats = ref({
   totalTrades: 0,
   wins: 0,
   losses: 0,
-  totalPnL: 0,
+  totalPnL: 0, // Net (after fees)
+  totalGrossPnL: 0, // Before fees
+  totalFees: 0,
   winRate: 0,
+  profitFactor: 0,
   longs: 0,
   shorts: 0,
   longWinRate: 0,
@@ -101,25 +168,37 @@ const stats = ref({
   shortPnL: 0,
 });
 
+const costModel = ref({
+  dexFeePercent: 0.25,
+  roundTripCostPercent: 0.6,
+  breakEvenMovePercent: 0.6,
+});
+
 // === SETTINGS ===
+// NOTE: With realistic fees (~0.6% round-trip), TP must be > 1% to profit!
 const settings = ref({
   // Entry settings
-  trendThreshold: 0.02, // % change to detect trend
+  trendThreshold: 0.3, // % change to detect trend (higher = fewer trades)
   trendTimeframe: '1m' as string,
-  
-  // Exit settings
-  takeProfitPercent: 0.05,
-  stopLossPercent: 0.03,
+
+  // Exit settings - REALISTIC for fees!
+  // Round-trip fees are ~0.6%, so TP must be > 1% to profit
+  takeProfitPercent: 1.5, // 1.5% TP (leaves ~0.9% after fees)
+  stopLossPercent: 0.8, // 0.8% SL (reasonable risk:reward)
   positionSizeSol: 0.1,
-  
+
   // Mode
-  testMode: true,
+  testMode: false, // Start in real mode to see realistic results
   testEntryChance: 15,
   testExitAfterSeconds: 15,
-  
+
   // Strategy
   allowLongs: true,
   allowShorts: true,
+
+  // Smart Strategy Mode
+  smartMode: true, // Use AI-powered signals by default
+  minConfidence: 25, // Minimum confidence to enter (aggressive for testing)
 });
 
 const showSettings = ref(false);
@@ -194,13 +273,40 @@ const timeframes = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
 const detectTrend = (): 'BULLISH' | 'BEARISH' | 'NEUTRAL' => {
   const { trendThreshold, trendTimeframe } = settings.value;
   const priceChange = candleData.value.priceChanges[trendTimeframe] || 0;
-  
+
   if (priceChange >= trendThreshold) {
     return 'BULLISH';
   } else if (priceChange <= -trendThreshold) {
     return 'BEARISH';
   }
   return 'NEUTRAL';
+};
+
+// Set trend with hysteresis to prevent flickering
+const setTrendWithHysteresis = (rawTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL') => {
+  // Same as confirmed - stay stable
+  if (rawTrend === confirmedTrend) {
+    pendingTrend = rawTrend;
+    pendingTrendCount = 0;
+    return; // No change needed
+  }
+
+  // Different trend - track it
+  if (rawTrend === pendingTrend) {
+    pendingTrendCount++;
+    if (pendingTrendCount >= TREND_STABILITY_REQUIRED) {
+      // Seen new trend enough times - switch
+      confirmedTrend = rawTrend;
+      pendingTrendCount = 0;
+      detectedTrend.value = rawTrend;
+    }
+    // else: not stable enough, keep current detectedTrend
+  } else {
+    // New pending trend - start fresh
+    pendingTrend = rawTrend;
+    pendingTrendCount = 1;
+    // Keep current detectedTrend
+  }
 };
 
 // === DATA FETCHING ===
@@ -229,12 +335,70 @@ const fetchData = async () => {
       if (json.data.candles) {
         candleData.value = json.data.candles;
       }
-      
-      // Update trend detection
-      detectedTrend.value = detectTrend();
+
+      // Update trend detection (only if we have candle data)
+      if (candleData.value.stats.totalCandles > 0) {
+        if (settings.value.smartMode) {
+          fetchStrategy();
+        } else {
+          setTrendWithHysteresis(detectTrend());
+        }
+      }
     }
   } catch (e) {
     console.error('Fetch error:', e);
+  }
+};
+
+const fetchStrategy = async () => {
+  try {
+    const body: any = {};
+
+    // If we have a position, send it for exit signal calculation
+    if (currentPosition.value) {
+      body.activePosition = {
+        direction: currentPosition.value.direction,
+        entryPrice: currentPosition.value.entryPrice,
+        entryTime: currentPosition.value.entryTime,
+        size: currentPosition.value.solAmount,
+        initialStopLoss: currentPosition.value.stopLoss,
+        currentStopLoss: currentPosition.value.stopLoss,
+        takeProfit: currentPosition.value.targetProfit,
+        maxPrice: Math.max(currentPosition.value.entryPrice, priceData.value.current),
+        minPrice: Math.min(currentPosition.value.entryPrice, priceData.value.current),
+        maxPnLPercent: Math.max(0, currentPnL.value.percent),
+      };
+    }
+
+    const res = await fetch('/api/strategy?timeframe=' + settings.value.trendTimeframe, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const json = await res.json();
+
+    if (json.success && json.data) {
+      strategySignal.value = json.data;
+
+      // Update trend based on composite SCORE (not just regime)
+      // This way we show directional bias even in ranging markets
+      // Score > 10 = bullish bias, Score < -10 = bearish bias
+      let rawTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+      const score = json.data.entry.score;
+
+      if (score >= 10) {
+        rawTrend = 'BULLISH';
+      } else if (score <= -10) {
+        rawTrend = 'BEARISH';
+      }
+      // else: score between -10 and 10 = NEUTRAL (no clear bias)
+
+      setTrendWithHysteresis(rawTrend);
+    }
+    // Don't log "insufficient data" errors - that's normal during startup
+  } catch (e: any) {
+    log(`❌ Strategy fetch error: ${e.message}`, 'error');
   }
 };
 
@@ -248,8 +412,11 @@ const fetchPortfolio = async () => {
         totalTrades: json.stats.totalTrades,
         wins: json.stats.wins,
         losses: json.stats.losses,
-        totalPnL: json.stats.totalPnL,
+        totalPnL: json.stats.totalPnL, // Net (after fees)
+        totalGrossPnL: json.stats.totalGrossPnL || json.stats.totalPnL,
+        totalFees: json.stats.totalFees || 0,
         winRate: json.stats.winRate,
+        profitFactor: json.stats.profitFactor || 0,
         longs: json.stats.longs || 0,
         shorts: json.stats.shorts || 0,
         longWinRate: json.stats.longWinRate || 0,
@@ -257,6 +424,11 @@ const fetchPortfolio = async () => {
         longPnL: json.stats.longPnL || 0,
         shortPnL: json.stats.shortPnL || 0,
       };
+
+      // Update cost model info
+      if (json.costModel) {
+        costModel.value = json.costModel;
+      }
 
       if (json.activeTrades && json.activeTrades.length > 0) {
         const active = json.activeTrades[0];
@@ -297,12 +469,24 @@ const fetchPortfolio = async () => {
 };
 
 // === TRADING LOGIC ===
-const checkTradeSignals = () => {
-  if (!isAutoTrading.value || !streamConnected.value) return;
-  if (priceData.value.current <= 0) return;
+const checkTradeSignals = async () => {
+  if (!isAutoTrading.value) {
+    return;
+  }
+  if (!streamConnected.value) {
+    return;
+  }
+  if (priceData.value.current <= 0) {
+    return;
+  }
 
-  // Update trend
-  detectedTrend.value = detectTrend();
+  // Fetch strategy signals if in smart mode
+  if (settings.value.smartMode && !settings.value.testMode) {
+    await fetchStrategy();
+  } else {
+    // Update trend with simple detection (with hysteresis)
+    setTrendWithHysteresis(detectTrend());
+  }
 
   if (hasPosition.value) {
     checkExitSignal();
@@ -312,15 +496,23 @@ const checkTradeSignals = () => {
 };
 
 const checkEntrySignal = () => {
-  const { testMode, testEntryChance, allowLongs, allowShorts } = settings.value;
-  
+  const { testMode, testEntryChance, allowLongs, allowShorts, smartMode, minConfidence } = settings.value;
+
+  // Debug: Log what mode we're in
+  if (!strategySignal.value && smartMode && !testMode) {
+    // Log once every 5 seconds if no signal
+    if (Date.now() % 5000 < 1000) {
+      log(`⏳ Waiting for strategy signal...`, 'info');
+    }
+  }
+
   if (testMode) {
     // Random entry for testing
     const roll = Math.random() * 100;
     if (roll < testEntryChance) {
       // Random direction based on current trend or 50/50
       let direction: 'LONG' | 'SHORT';
-      
+
       if (detectedTrend.value === 'BULLISH' && allowLongs) {
         direction = 'LONG';
       } else if (detectedTrend.value === 'BEARISH' && allowShorts) {
@@ -340,14 +532,60 @@ const checkEntrySignal = () => {
           return; // Neither allowed
         }
       }
-      
+
       log(`🎲 Test: ${direction} entry (trend: ${detectedTrend.value})`, 'info');
       enterPosition(direction);
     }
     return;
   }
 
-  // Real strategy: follow the trend
+  // === SMART MODE: Use strategy signals ===
+  if (smartMode && strategySignal.value) {
+    const signal = strategySignal.value;
+    const entry = signal.entry;
+
+    // Log signal status every 10 seconds
+    if (Date.now() % 10000 < 1000) {
+      log(`📊 Signal: ${entry.direction} | Score: ${entry.score.toFixed(1)} | Conf: ${entry.confidence.toFixed(0)}% | Enter: ${entry.shouldEnter}`, 'info');
+    }
+
+    // Check if we have a valid entry signal
+    if (!entry.shouldEnter || entry.direction === 'NONE') {
+      return;
+    }
+
+    // Check confidence threshold
+    if (entry.confidence < minConfidence) {
+      log(`⚠️ Confidence ${entry.confidence.toFixed(0)}% below ${minConfidence}%`, 'warn');
+      return;
+    }
+
+    // Check direction is allowed
+    if (entry.direction === 'LONG' && !allowLongs) {
+      log(`❌ LONG blocked - longs disabled`, 'warn');
+      return;
+    }
+    if (entry.direction === 'SHORT' && !allowShorts) {
+      log(`❌ SHORT blocked - shorts disabled`, 'warn');
+      return;
+    }
+
+    // Log the smart entry
+    const regime = signal.regime.regime;
+    const score = entry.score.toFixed(0);
+    const conf = entry.confidence.toFixed(0);
+    log(`🚀 ENTERING ${entry.direction}: Score ${score}, Conf ${conf}%, Regime: ${regime}`, 'success');
+
+    if (entry.reasons.length > 0) {
+      log(`   Reasons: ${entry.reasons.slice(0, 2).join(', ')}`, 'info');
+    }
+
+    // Enter with strategy-suggested levels
+    enterPositionSmart(entry.direction, entry.suggestedStopLoss, entry.suggestedTakeProfit);
+    return;
+  }
+
+  // === SIMPLE MODE: Follow the trend ===
   if (detectedTrend.value === 'BULLISH' && allowLongs) {
     log(`📈 Bullish trend detected - entering LONG`, 'info');
     enterPosition('LONG');
@@ -360,7 +598,7 @@ const checkEntrySignal = () => {
 const checkExitSignal = () => {
   if (!currentPosition.value) return;
 
-  const { takeProfitPercent, stopLossPercent, testMode, testExitAfterSeconds } = settings.value;
+  const { takeProfitPercent, stopLossPercent, testMode, testExitAfterSeconds, smartMode } = settings.value;
   const pnlPercent = currentPnL.value.percent;
   const holdTime = (Date.now() - currentPosition.value.entryTime) / 1000;
 
@@ -371,6 +609,30 @@ const checkExitSignal = () => {
     exitPosition(reason);
     return;
   }
+
+  // === SMART MODE: Use strategy exit signals ===
+  if (smartMode && strategySignal.value?.exit) {
+    const exit = strategySignal.value.exit;
+
+    if (exit.shouldExit) {
+      const urgencyEmoji = exit.urgency === 'critical' ? '🚨' : exit.urgency === 'high' ? '⚠️' : '📊';
+      log(`${urgencyEmoji} SMART EXIT: ${exit.reason} (${exit.urgency})`, 'info');
+      log(`   ${exit.explanation}`, 'info');
+
+      // Show trailing stop info if active
+      if (exit.trailingStopPrice) {
+        log(`   Trailing stop was at: $${exit.trailingStopPrice.toFixed(4)}`, 'info');
+      }
+
+      exitPosition(exit.reason);
+      return;
+    }
+
+    // If smart mode but no exit signal, still check basic stops as safety
+    // (Strategy already checked these, but double-check for safety)
+  }
+
+  // === BASIC EXIT CHECKS (always run as safety net) ===
 
   // Take profit
   if (pnlPercent >= takeProfitPercent) {
@@ -406,6 +668,11 @@ const enterPosition = async (direction: 'LONG' | 'SHORT') => {
           amount: usdAmount,
           size: positionSizeSol,
           timestamp: Date.now(),
+          // Phase 5: Pass signal data for diagnostics
+          signalScore: 0,
+          signalConfidence: 0,
+          stopLossPercent,
+          takeProfitPercent,
         },
       }),
     });
@@ -434,6 +701,69 @@ const enterPosition = async (direction: 'LONG' | 'SHORT') => {
       const emoji = direction === 'LONG' ? '🟢📈' : '🔴📉';
       log(`${emoji} ${direction} @ $${price.toFixed(4)} | Size: ${positionSizeSol} SOL`, 'success');
       log(`🎯 TP: $${tp.toFixed(4)} | 🛑 SL: $${sl.toFixed(4)}`, 'info');
+    } else {
+      log(`❌ Entry failed: ${json.error}`, 'error');
+    }
+  } catch (e: any) {
+    log(`❌ Entry error: ${e.message}`, 'error');
+  }
+};
+
+// Smart entry with strategy-suggested levels
+const enterPositionSmart = async (direction: 'LONG' | 'SHORT', suggestedSL: number, suggestedTP: number) => {
+  const price = priceData.value.current;
+  if (price <= 0) return;
+
+  const { positionSizeSol } = settings.value;
+  const usdAmount = positionSizeSol * price;
+
+  // Get signal data for diagnostics
+  const signalScore = strategySignal.value?.entry.score ?? 0;
+  const signalConfidence = strategySignal.value?.entry.confidence ?? 0;
+  const slPercent = Math.abs((suggestedSL - price) / price * 100);
+  const tpPercent = Math.abs((suggestedTP - price) / price * 100);
+
+  try {
+    const res = await fetch('/api/trade', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'OPEN',
+        trade: {
+          symbol: 'SOL/USDC',
+          address: 'SOL',
+          direction,
+          entryPrice: price,
+          amount: usdAmount,
+          size: positionSizeSol,
+          timestamp: Date.now(),
+          // Phase 5: Pass signal data for diagnostics
+          signalScore,
+          signalConfidence,
+          stopLossPercent: slPercent,
+          takeProfitPercent: tpPercent,
+        },
+      }),
+    });
+
+    const json = await res.json();
+
+    if (json.success) {
+      currentPosition.value = {
+        id: json.trade.id,
+        direction,
+        entryPrice: price,
+        entryTime: Date.now(),
+        targetProfit: suggestedTP,
+        stopLoss: suggestedSL,
+        solAmount: positionSizeSol,
+        usdAmount,
+      };
+
+      const emoji = direction === 'LONG' ? '🟢📈' : '🔴📉';
+
+      log(`${emoji} ${direction} @ $${price.toFixed(4)} | Size: ${positionSizeSol} SOL`, 'success');
+      log(`🎯 TP: $${suggestedTP.toFixed(4)} (+${tpPercent.toFixed(3)}%) | 🛑 SL: $${suggestedSL.toFixed(4)} (-${slPercent.toFixed(3)}%)`, 'info');
     } else {
       log(`❌ Entry failed: ${json.error}`, 'error');
     }
@@ -531,18 +861,6 @@ const manualClose = () => {
   }
 };
 
-const manualLong = () => {
-  if (!currentPosition.value && priceData.value.current > 0) {
-    enterPosition('LONG');
-  }
-};
-
-const manualShort = () => {
-  if (!currentPosition.value && priceData.value.current > 0) {
-    enterPosition('SHORT');
-  }
-};
-
 // === LOGGING ===
 const log = (message: string, type: 'info' | 'success' | 'warn' | 'error' = 'info') => {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -605,6 +923,9 @@ onUnmounted(() => {
           <span v-if="settings.testMode" class="px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded-full">
             TEST
           </span>
+          <span v-if="settings.smartMode && !settings.testMode" class="px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
+            SMART
+          </span>
         </div>
         <div class="flex items-center gap-4">
           <span class="text-xs" :class="trendClass">{{ trendEmoji }} {{ detectedTrend }}</span>
@@ -660,7 +981,7 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <!-- Status & Controls -->
+        <!-- Bot Controls -->
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-2">
             <span class="text-sm text-gray-400">Status:</span>
@@ -668,34 +989,18 @@ onUnmounted(() => {
           </div>
           <div class="flex gap-2">
             <button
-              v-if="!hasPosition"
-              @click="manualLong"
-              class="px-3 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-medium text-sm transition-colors"
-              :disabled="priceData.current <= 0"
-            >
-              📈 Long
-            </button>
-            <button
-              v-if="!hasPosition"
-              @click="manualShort"
-              class="px-3 py-2 bg-red-600 hover:bg-red-700 rounded-lg font-medium text-sm transition-colors"
-              :disabled="priceData.current <= 0"
-            >
-              📉 Short
-            </button>
-            <button
               v-if="!isAutoTrading"
               @click="startBot"
-              class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium text-sm transition-colors"
+              class="px-6 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-medium transition-colors"
             >
-              ▶ Auto
+              ▶ Start Bot
             </button>
             <button
               v-if="isAutoTrading"
               @click="stopBot"
-              class="px-4 py-2 bg-gray-600 hover:bg-gray-700 rounded-lg font-medium text-sm transition-colors"
+              class="px-6 py-2 bg-red-600 hover:bg-red-700 rounded-lg font-medium transition-colors"
             >
-              ⏸ Stop
+              ⏹ Stop Bot
             </button>
             <button
               v-if="hasPosition"
@@ -708,8 +1013,60 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- System Status Panel -->
+      <div v-if="strategySignal && isAutoTrading" class="bg-gray-900/50 rounded-xl p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-3">System Status</div>
+        <div class="grid grid-cols-3 gap-3">
+          <!-- Tradability -->
+          <div class="p-3 rounded-lg" :class="strategySignal.tradability.isTradable ? 'bg-green-500/10 border border-green-500/30' : 'bg-red-500/10 border border-red-500/30'">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-2 h-2 rounded-full" :class="strategySignal.tradability.isTradable ? 'bg-green-500' : 'bg-red-500'"></span>
+              <span class="text-xs font-medium">Market</span>
+            </div>
+            <div class="text-xs" :class="strategySignal.tradability.isTradable ? 'text-green-400' : 'text-red-400'">
+              {{ strategySignal.tradability.isTradable ? 'Tradable' : strategySignal.tradability.reason || 'Not tradable' }}
+            </div>
+          </div>
+
+          <!-- Throttle -->
+          <div class="p-3 rounded-lg" :class="strategySignal.throttle.canTrade ? 'bg-green-500/10 border border-green-500/30' : 'bg-yellow-500/10 border border-yellow-500/30'">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-2 h-2 rounded-full" :class="strategySignal.throttle.canTrade ? 'bg-green-500' : 'bg-yellow-500'"></span>
+              <span class="text-xs font-medium">Throttle</span>
+            </div>
+            <div class="text-xs" :class="strategySignal.throttle.canTrade ? 'text-green-400' : 'text-yellow-400'">
+              <template v-if="strategySignal.throttle.canTrade">
+                {{ strategySignal.throttle.tradesThisHour }}/{{ strategySignal.throttle.maxTradesPerHour }} trades
+              </template>
+              <template v-else>
+                {{ strategySignal.throttle.reason }}
+              </template>
+            </div>
+            <div v-if="strategySignal.throttle.cooldownRemaining > 0" class="text-xs text-yellow-400 mt-1">
+              Cooldown: {{ Math.ceil(strategySignal.throttle.cooldownRemaining / 1000) }}s
+            </div>
+          </div>
+
+          <!-- Entry Confirmation -->
+          <div class="p-3 rounded-lg" :class="strategySignal.entryConfirmation?.confirmed ? 'bg-green-500/10 border border-green-500/30' : 'bg-gray-800 border border-gray-700'">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-2 h-2 rounded-full" :class="strategySignal.entryConfirmation?.confirmed ? 'bg-green-500' : 'bg-gray-500'"></span>
+              <span class="text-xs font-medium">Entry</span>
+            </div>
+            <div class="text-xs" :class="strategySignal.entryConfirmation?.confirmed ? 'text-green-400' : 'text-gray-400'">
+              <template v-if="strategySignal.entryConfirmation">
+                {{ strategySignal.entryConfirmation.confirmed ? 'Ready' : strategySignal.entryConfirmation.reason || 'Waiting' }}
+              </template>
+              <template v-else>
+                Waiting for signal
+              </template>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Position Card -->
-      <div 
+      <div
         v-if="hasPosition && currentPosition" 
         class="rounded-2xl p-4 border"
         :class="currentPosition.direction === 'LONG' 
@@ -753,9 +1110,9 @@ onUnmounted(() => {
 
       <!-- Stats Grid -->
       <div class="grid grid-cols-2 gap-3">
-        <!-- Overall Stats -->
+        <!-- Overall Stats with Fees -->
         <div class="bg-gray-900/50 rounded-xl p-4 border border-gray-800">
-          <div class="text-xs text-gray-500 mb-2">Overall</div>
+          <div class="text-xs text-gray-500 mb-2">Performance (Net of Fees)</div>
           <div class="grid grid-cols-2 gap-2 text-center">
             <div>
               <div class="text-lg font-bold">{{ stats.totalTrades }}</div>
@@ -769,16 +1126,21 @@ onUnmounted(() => {
               <div class="text-lg font-bold" :class="stats.totalPnL >= 0 ? 'text-green-400' : 'text-red-400'">
                 {{ stats.totalPnL >= 0 ? '+' : '' }}${{ stats.totalPnL.toFixed(4) }}
               </div>
-              <div class="text-xs text-gray-500">Total P&L</div>
+              <div class="text-xs text-gray-500">Net P&L</div>
             </div>
             <div>
-              <div class="text-lg font-bold">
-                <span class="text-green-400">{{ stats.wins }}</span>
-                <span class="text-gray-600">/</span>
-                <span class="text-red-400">{{ stats.losses }}</span>
+              <div class="text-lg font-bold text-yellow-400">
+                -${{ stats.totalFees.toFixed(4) }}
               </div>
-              <div class="text-xs text-gray-500">W / L</div>
+              <div class="text-xs text-gray-500">Fees Paid</div>
             </div>
+          </div>
+          <!-- Profit Factor -->
+          <div class="mt-2 pt-2 border-t border-gray-800 flex justify-between text-xs">
+            <span class="text-gray-500">Profit Factor:</span>
+            <span :class="stats.profitFactor >= 1 ? 'text-green-400' : 'text-red-400'">
+              {{ stats.profitFactor.toFixed(2) }}
+            </span>
           </div>
         </div>
 
@@ -801,6 +1163,13 @@ onUnmounted(() => {
               <div class="text-xs" :class="stats.shortPnL >= 0 ? 'text-green-400' : 'text-red-400'">
                 {{ stats.shortPnL >= 0 ? '+' : '' }}${{ stats.shortPnL.toFixed(4) }}
               </div>
+            </div>
+          </div>
+          <!-- Cost Model Info -->
+          <div class="mt-2 pt-2 border-t border-gray-800 text-xs text-gray-500">
+            <div class="flex justify-between">
+              <span>Round-trip cost:</span>
+              <span class="text-yellow-400">~{{ costModel.roundTripCostPercent.toFixed(2) }}%</span>
             </div>
           </div>
         </div>
@@ -950,118 +1319,31 @@ onUnmounted(() => {
     <div v-if="showSettings" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4" @click.self="showSettings = false">
       <div class="bg-gray-900 rounded-2xl p-6 w-full max-w-md border border-gray-800 max-h-[90vh] overflow-y-auto">
         <div class="flex items-center justify-between mb-6">
-          <h2 class="text-lg font-bold">⚙️ Settings</h2>
-          <button @click="showSettings = false" class="text-gray-400 hover:text-white text-xl">✕</button>
+          <h2 class="text-lg font-bold">Settings</h2>
+          <button @click="showSettings = false" class="text-gray-400 hover:text-white text-xl">x</button>
         </div>
 
-        <!-- Test Mode -->
-        <div class="mb-6 p-4 rounded-xl" :class="settings.testMode ? 'bg-yellow-500/10 border border-yellow-500/30' : 'bg-gray-800'">
-          <div class="flex items-center justify-between mb-2">
-            <label class="font-medium">🎲 Test Mode</label>
-            <button
-              @click="settings.testMode = !settings.testMode"
-              class="w-12 h-6 rounded-full transition-colors"
-              :class="settings.testMode ? 'bg-yellow-500' : 'bg-gray-600'"
-            >
-              <div
-                class="w-5 h-5 bg-white rounded-full shadow transition-transform"
-                :class="settings.testMode ? 'translate-x-6' : 'translate-x-0.5'"
-              />
-            </button>
-          </div>
-          <p class="text-xs text-gray-400">
-            {{ settings.testMode ? 'Random entries for testing' : 'Real trend-following signals' }}
-          </p>
+        <!-- Position Size -->
+        <div class="mb-6">
+          <label class="text-sm text-gray-400">Position Size (SOL)</label>
+          <input
+            v-model.number="settings.positionSizeSol"
+            type="number"
+            step="0.01"
+            min="0.01"
+            class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-lg font-medium"
+          />
         </div>
 
-        <!-- Direction Toggles -->
-        <div class="mb-6 grid grid-cols-2 gap-3">
-          <div 
-            class="p-4 rounded-xl cursor-pointer transition-all"
-            :class="settings.allowLongs ? 'bg-green-500/20 border border-green-500/50' : 'bg-gray-800'"
-            @click="settings.allowLongs = !settings.allowLongs"
-          >
-            <div class="text-center">
-              <div class="text-2xl mb-1">📈</div>
-              <div class="font-medium">Longs</div>
-              <div class="text-xs" :class="settings.allowLongs ? 'text-green-400' : 'text-gray-500'">
-                {{ settings.allowLongs ? 'Enabled' : 'Disabled' }}
-              </div>
-            </div>
-          </div>
-          <div 
-            class="p-4 rounded-xl cursor-pointer transition-all"
-            :class="settings.allowShorts ? 'bg-red-500/20 border border-red-500/50' : 'bg-gray-800'"
-            @click="settings.allowShorts = !settings.allowShorts"
-          >
-            <div class="text-center">
-              <div class="text-2xl mb-1">📉</div>
-              <div class="font-medium">Shorts</div>
-              <div class="text-xs" :class="settings.allowShorts ? 'text-red-400' : 'text-gray-500'">
-                {{ settings.allowShorts ? 'Enabled' : 'Disabled' }}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Test Mode Settings -->
-        <div v-if="settings.testMode" class="space-y-4 mb-6">
-          <div>
-            <label class="text-sm text-gray-400">Entry Chance (%/sec)</label>
-            <input
-              v-model.number="settings.testEntryChance"
-              type="number"
-              min="1"
-              max="100"
-              class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
-            />
-          </div>
-          <div>
-            <label class="text-sm text-gray-400">Auto-Exit After (sec)</label>
-            <input
-              v-model.number="settings.testExitAfterSeconds"
-              type="number"
-              min="1"
-              max="300"
-              class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
-            />
-          </div>
-        </div>
-
-        <!-- Live Mode Settings -->
-        <div v-if="!settings.testMode" class="space-y-4 mb-6">
-          <div>
-            <label class="text-sm text-gray-400">Trend Threshold (%)</label>
-            <input
-              v-model.number="settings.trendThreshold"
-              type="number"
-              step="0.01"
-              class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
-            />
-            <p class="text-xs text-gray-500 mt-1">
-              Price change % to detect bullish/bearish trend
-            </p>
-          </div>
-          <div>
-            <label class="text-sm text-gray-400">Trend Timeframe</label>
-            <select
-              v-model="settings.trendTimeframe"
-              class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
-            >
-              <option v-for="tf in timeframes" :key="tf" :value="tf">{{ tf }}</option>
-            </select>
-          </div>
-        </div>
-
-        <!-- Exit Settings -->
-        <div class="space-y-4">
-          <div class="text-sm font-medium text-gray-300">Exit Settings</div>
+        <!-- TP/SL Settings -->
+        <div class="grid grid-cols-2 gap-4 mb-6">
           <div>
             <label class="text-sm text-gray-400">Take Profit (%)</label>
             <input
               v-model.number="settings.takeProfitPercent"
               type="number"
-              step="0.01"
+              step="0.1"
+              min="0.1"
               class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
             />
           </div>
@@ -1070,18 +1352,48 @@ onUnmounted(() => {
             <input
               v-model.number="settings.stopLossPercent"
               type="number"
-              step="0.01"
+              step="0.1"
+              min="0.1"
               class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
             />
           </div>
-          <div>
-            <label class="text-sm text-gray-400">Position Size (SOL)</label>
-            <input
-              v-model.number="settings.positionSizeSol"
-              type="number"
-              step="0.01"
-              class="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg"
-            />
+        </div>
+
+        <!-- Direction Toggles -->
+        <div class="mb-6 grid grid-cols-2 gap-3">
+          <div
+            class="p-4 rounded-xl cursor-pointer transition-all"
+            :class="settings.allowLongs ? 'bg-green-500/20 border border-green-500/50' : 'bg-gray-800 border border-gray-700'"
+            @click="settings.allowLongs = !settings.allowLongs"
+          >
+            <div class="text-center">
+              <div class="font-medium">Longs</div>
+              <div class="text-xs" :class="settings.allowLongs ? 'text-green-400' : 'text-gray-500'">
+                {{ settings.allowLongs ? 'Enabled' : 'Disabled' }}
+              </div>
+            </div>
+          </div>
+          <div
+            class="p-4 rounded-xl cursor-pointer transition-all"
+            :class="settings.allowShorts ? 'bg-red-500/20 border border-red-500/50' : 'bg-gray-800 border border-gray-700'"
+            @click="settings.allowShorts = !settings.allowShorts"
+          >
+            <div class="text-center">
+              <div class="font-medium">Shorts</div>
+              <div class="text-xs" :class="settings.allowShorts ? 'text-red-400' : 'text-gray-500'">
+                {{ settings.allowShorts ? 'Enabled' : 'Disabled' }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cost Info -->
+        <div class="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg mb-6">
+          <div class="text-xs text-yellow-400">
+            Round-trip cost: ~{{ costModel.roundTripCostPercent.toFixed(2) }}%
+          </div>
+          <div class="text-xs text-gray-400 mt-1">
+            TP should be > {{ (costModel.roundTripCostPercent + 0.5).toFixed(1) }}% to profit after fees
           </div>
         </div>
 

@@ -137,7 +137,10 @@ export function getCandles(timeframe: Timeframe, limit: number = 50): Candle[] {
     result.push(current);
   }
 
-  result.push(...candles[timeframe].slice(0, limit - 1));
+  const tfCandles = candles[timeframe];
+  if (tfCandles && tfCandles.length > 0) {
+    result.push(...tfCandles.slice(0, limit - 1));
+  }
 
   return result;
 }
@@ -218,4 +221,52 @@ export function resetCandles(): void {
   totalTrades = 0;
 
   console.log('[SolCandles] Reset all candle data');
+}
+
+// === HISTORICAL DATA LOADING ===
+
+/**
+ * Load historical candles into storage
+ * Called on startup to provide historical context for indicators
+ */
+export function loadHistoricalCandles(
+  timeframe: Timeframe,
+  historicalCandles: Candle[]
+): void {
+  if (historicalCandles.length === 0) return;
+
+  const maxCandles = MAX_CANDLES[timeframe];
+
+  // Historical candles should already be sorted newest-first
+  // Take up to maxCandles
+  candles[timeframe] = historicalCandles.slice(0, maxCandles);
+
+  // Set lastPrice from the most recent candle if we don't have one yet
+  if (lastPrice === 0 && historicalCandles.length > 0) {
+    lastPrice = historicalCandles[0].close;
+  }
+
+  console.log(`[SolCandles] Loaded ${candles[timeframe].length} historical ${timeframe} candles`);
+}
+
+/**
+ * Load all historical candles from a map
+ */
+export function loadAllHistoricalCandles(
+  candleMap: Map<string, Candle[]>
+): void {
+  const validTimeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
+
+  for (const [tf, historicalCandles] of candleMap) {
+    if (validTimeframes.includes(tf as Timeframe)) {
+      loadHistoricalCandles(tf as Timeframe, historicalCandles);
+    }
+  }
+
+  // Log summary
+  const totalLoaded = validTimeframes.reduce(
+    (sum, tf) => sum + candles[tf].length,
+    0
+  );
+  console.log(`[SolCandles] ✅ Total historical candles loaded: ${totalLoaded}`);
 }

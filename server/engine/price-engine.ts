@@ -2,15 +2,15 @@
 
 /**
  * Price Engine
- * 
+ *
  * Real-time SOL/USDC price tracking via Helius WebSocket
- * Simple. Fast. No fallback complexity.
  */
 
 import { WSConnection } from './ws-connection';
 import { PoolSubscriber } from './pool-subscriber';
 import { eventBus, EVENTS, type PriceUpdate } from './event-bus';
-import { updatePrice, resetCandles } from '../utils/sol-candles';
+import { updatePrice, resetCandles, loadHistoricalCandles, loadAllHistoricalCandles } from '../utils/sol-candles';
+import { fetchAllHistoricalCandles, buildDerivedCandles } from '../utils/historical-candles';
 
 export class PriceEngine {
   private wsConnection: WSConnection | null = null;
@@ -45,8 +45,47 @@ export class PriceEngine {
     // Setup price update listener
     this.setupPriceListener();
 
-    // Connect WebSocket
+    // Connect WebSocket first (so server is responsive)
     await this.connect();
+
+    // Load historical candles in background (non-blocking)
+    this.loadHistoricalData().catch(err => {
+      console.error('[PriceEngine] Historical data error:', err);
+    });
+  }
+
+  /**
+   * Fetch and load historical candle data from Birdeye
+   */
+  private async loadHistoricalData(): Promise<void> {
+    try {
+      console.log('[PriceEngine] 📊 Loading historical candles...');
+
+      // Fetch historical candles from Birdeye (no API key needed for basic access)
+      const candleMap = await fetchAllHistoricalCandles();
+
+      if (candleMap.size === 0) {
+        console.log('[PriceEngine] ⚠️ No historical data available - starting fresh');
+        return;
+      }
+
+      // Build derived timeframes (2m, 10m) from 1m data
+      const oneMinCandles = candleMap.get('1m');
+      if (oneMinCandles && oneMinCandles.length > 0) {
+        const { twoMin, tenMin } = buildDerivedCandles(oneMinCandles);
+        if (twoMin.length > 0) candleMap.set('2m', twoMin);
+        if (tenMin.length > 0) candleMap.set('10m', tenMin);
+      }
+
+      // Load all candles into storage
+      loadAllHistoricalCandles(candleMap);
+
+      console.log('[PriceEngine] ✅ Historical data loaded - indicators ready!');
+
+    } catch (error) {
+      console.error('[PriceEngine] ⚠️ Failed to load historical data:', error);
+      console.log('[PriceEngine] Continuing without historical data...');
+    }
   }
 
   private async connect(): Promise<void> {
