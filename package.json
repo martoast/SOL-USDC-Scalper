@@ -26,6 +26,7 @@
     "@tailwindcss/postcss": "^4.1.17",
     "@tailwindcss/typography": "^0.5.19",
     "buffer": "^6.0.3",
+    "lightweight-charts": "^5.1.0",
     "nuxt": "^4.2.1",
     "solana-wallets-vue": "^0.7.1",
     "vite-plugin-node-polyfills": "^0.24.0",

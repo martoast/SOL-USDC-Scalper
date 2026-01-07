@@ -174,6 +174,19 @@ const costModel = ref({
   breakEvenMovePercent: 0.6,
 });
 
+// === CHART DATA ===
+const chartCandles = ref<Candle[]>([]);
+const chartSignal = computed(() => {
+  if (!strategySignal.value) return null;
+  return {
+    direction: strategySignal.value.entry.direction,
+    score: strategySignal.value.entry.score,
+    confidence: strategySignal.value.entry.confidence,
+    reasons: strategySignal.value.entry.reasons,
+    shouldEnter: strategySignal.value.entry.shouldEnter,
+  };
+});
+
 // === SETTINGS ===
 // NOTE: With realistic fees (~0.6% round-trip), TP must be > 1% to profit!
 const settings = ref({
@@ -347,6 +360,19 @@ const fetchData = async () => {
     }
   } catch (e) {
     console.error('Fetch error:', e);
+  }
+};
+
+// Fetch candle data for chart (less frequent than price updates)
+const fetchChartData = async () => {
+  try {
+    const res = await fetch(`/api/stream/candles?timeframe=${settings.value.trendTimeframe}&limit=50`);
+    const json = await res.json();
+    if (json.success && json.data?.candles) {
+      chartCandles.value = json.data.candles;
+    }
+  } catch (e) {
+    console.error('Chart data fetch error:', e);
   }
 };
 
@@ -816,6 +842,11 @@ const exitPosition = async (reason: string) => {
         reason,
       });
 
+      // Limit trade logs to prevent unbounded memory growth
+      if (tradeLogs.value.length > 100) {
+        tradeLogs.value = tradeLogs.value.slice(0, 100);
+      }
+
       const emoji = pnl > 0 ? '🟢' : '🔴';
       const dirEmoji = direction === 'LONG' ? '📈' : '📉';
       log(
@@ -894,15 +925,20 @@ const getChangeClass = (change: number | undefined) => {
 };
 
 // === LIFECYCLE ===
+let chartTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(async () => {
   await fetchData();
   await fetchPortfolio();
+  await fetchChartData();
   dataTimer = setInterval(fetchData, 500);
+  chartTimer = setInterval(fetchChartData, 1000); // Chart updates every 1s
 });
 
 onUnmounted(() => {
   if (dataTimer) clearInterval(dataTimer);
   if (tradingTimer) clearInterval(tradingTimer);
+  if (chartTimer) clearInterval(chartTimer);
 });
 </script>
 
@@ -1012,6 +1048,16 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
+
+      <!-- Trading Chart -->
+      <TradingChart
+        v-if="chartCandles.length > 0"
+        :candles="chartCandles"
+        :indicators="null"
+        :signal="chartSignal"
+        :timeframe="settings.trendTimeframe"
+        class="mt-4"
+      />
 
       <!-- System Status Panel -->
       <div v-if="strategySignal && isAutoTrading" class="bg-gray-900/50 rounded-xl p-4 border border-gray-800">

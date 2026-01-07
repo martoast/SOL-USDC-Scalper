@@ -185,7 +185,7 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   trailingStopDistancePercent: 0.4, // Trail by 0.4%
 
   // Time stop (exit stale positions)
-  maxHoldTimeSeconds: 1800, // 30 minutes max hold (need time to hit TP)
+  maxHoldTimeSeconds: 7200, // 2 hours max hold (flat markets need more time)
 
   // Position sizing
   basePositionSize: 0.1,

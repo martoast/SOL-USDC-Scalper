@@ -16,7 +16,7 @@ export interface Candle {
   timestamp: number;
 }
 
-export type Timeframe = '1s' | '1m' | '2m' | '5m' | '10m' | '30m' | '1h';
+export type Timeframe = '1s' | '1m' | '2m' | '5m' | '10m' | '15m' | '30m' | '1h';
 
 // === CONFIGURATION ===
 const TIMEFRAME_MS: Record<Timeframe, number> = {
@@ -25,16 +25,18 @@ const TIMEFRAME_MS: Record<Timeframe, number> = {
   '2m': 2 * 60 * 1000,
   '5m': 5 * 60 * 1000,
   '10m': 10 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
   '30m': 30 * 60 * 1000,
   '1h': 60 * 60 * 1000,
 };
 
 const MAX_CANDLES: Record<Timeframe, number> = {
   '1s': 120,
-  '1m': 60,
-  '2m': 60,
-  '5m': 60,
+  '1m': 100,
+  '2m': 100,
+  '5m': 100,
   '10m': 60,
+  '15m': 48,
   '30m': 48,
   '1h': 48,
 };
@@ -46,6 +48,7 @@ const candles: Record<Timeframe, Candle[]> = {
   '2m': [],
   '5m': [],
   '10m': [],
+  '15m': [],
   '30m': [],
   '1h': [],
 };
@@ -56,6 +59,7 @@ const currentCandle: Record<Timeframe, Candle | null> = {
   '2m': null,
   '5m': null,
   '10m': null,
+  '15m': null,
   '30m': null,
   '1h': null,
 };
@@ -75,7 +79,7 @@ export function updatePrice(price: number, timestamp: number = Date.now()): void
 
   lastPrice = price;
 
-  const timeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
+  const timeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '15m', '30m', '1h'];
 
   for (const tf of timeframes) {
     updateTimeframe(tf, price, timestamp, isNewPrice);
@@ -210,7 +214,7 @@ export function getAllPriceChanges(): Record<Timeframe, number> {
 // === CLEANUP ===
 
 export function resetCandles(): void {
-  const timeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
+  const timeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '15m', '30m', '1h'];
 
   for (const tf of timeframes) {
     candles[tf] = [];
@@ -255,7 +259,7 @@ export function loadHistoricalCandles(
 export function loadAllHistoricalCandles(
   candleMap: Map<string, Candle[]>
 ): void {
-  const validTimeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '30m', '1h'];
+  const validTimeframes: Timeframe[] = ['1s', '1m', '2m', '5m', '10m', '15m', '30m', '1h'];
 
   for (const [tf, historicalCandles] of candleMap) {
     if (validTimeframes.includes(tf as Timeframe)) {

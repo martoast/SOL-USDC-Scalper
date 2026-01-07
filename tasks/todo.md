@@ -383,3 +383,26 @@ Entry protection is now 3-layer:
 3. **Entry Confirmation** - Is the 1m timeframe confirming the signal?
 
 All gates must pass for entry. Exits are always allowed (position management).
+
+---
+
+## Long-Running Stability Fixes
+
+### Memory Leak Prevention
+
+Added limits to prevent unbounded memory growth for multi-day operation:
+
+1. **Trade Logs (Frontend)** - `pages/index.vue`
+   - Limited to 100 most recent trades
+   - New trades added via `unshift`, trimmed if > 100
+
+2. **Completed Diagnostics (Backend)** - `server/diagnostics/trade-tracker.ts`
+   - Limited to 500 most recent trade diagnostics
+   - Old entries pruned on each new trade completion
+
+3. **WebSocket Pending Requests** - `server/engine/ws-connection.ts`
+   - Already has cleanup (every 5 min, clears if > 50 pending)
+   - Heartbeat requests auto-timeout after 5 seconds
+   - All cleared on disconnect
+
+**Result:** App can now run for days without memory issues.

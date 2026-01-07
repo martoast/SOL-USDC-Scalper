@@ -46,8 +46,8 @@ export async function fetchFromBirdeye(
     '1H': 3600,
   };
   const secondsPerCandle = timeframeSeconds[timeframe] || 60;
-  // Request enough time to get ~200 candles
-  const timeFrom = now - (200 * secondsPerCandle);
+  // Request enough time to get ~500 candles (need enough for 15m ATR which needs 15+ candles)
+  const timeFrom = now - (500 * secondsPerCandle);
 
   const url = `https://public-api.birdeye.so/defi/ohlcv?address=${SOL_ADDRESS}&type=${timeframe}&time_from=${timeFrom}&time_to=${now}`;
 
@@ -245,21 +245,21 @@ export async function fetchAllHistoricalCandles(apiKey?: string): Promise<Map<st
       result.set('1m', oneMinCandles.slice(0, 100)); // Keep 100 most recent
 
       // Build other timeframes from 1m data
+      const twoMinCandles = buildLargerTimeframe(oneMinCandles, 2);
       const fiveMinCandles = buildLargerTimeframe(oneMinCandles, 5);
+      const tenMinCandles = buildLargerTimeframe(oneMinCandles, 10);
+      const fifteenMinCandles = buildLargerTimeframe(oneMinCandles, 15);
       const thirtyMinCandles = buildLargerTimeframe(oneMinCandles, 30);
       const hourlyCandles = buildLargerTimeframe(oneMinCandles, 60);
 
+      if (twoMinCandles.length > 0) result.set('2m', twoMinCandles);
       if (fiveMinCandles.length > 0) result.set('5m', fiveMinCandles);
+      if (tenMinCandles.length > 0) result.set('10m', tenMinCandles);
+      if (fifteenMinCandles.length > 0) result.set('15m', fifteenMinCandles);
       if (thirtyMinCandles.length > 0) result.set('30m', thirtyMinCandles);
       if (hourlyCandles.length > 0) result.set('1h', hourlyCandles);
 
-      // Also build 2m and 10m
-      const twoMinCandles = buildLargerTimeframe(oneMinCandles, 2);
-      const tenMinCandles = buildLargerTimeframe(oneMinCandles, 10);
-      if (twoMinCandles.length > 0) result.set('2m', twoMinCandles);
-      if (tenMinCandles.length > 0) result.set('10m', tenMinCandles);
-
-      console.log(`[Historical] ✅ Birdeye: 1m=${oneMinCandles.length}, 5m=${fiveMinCandles.length}, 30m=${thirtyMinCandles.length}, 1h=${hourlyCandles.length}`);
+      console.log(`[Historical] ✅ Birdeye: 1m=${oneMinCandles.length}, 5m=${fiveMinCandles.length}, 15m=${fifteenMinCandles.length}, 30m=${thirtyMinCandles.length}, 1h=${hourlyCandles.length}`);
       return result;
     }
   }
@@ -288,11 +288,12 @@ export async function fetchAllHistoricalCandles(apiKey?: string): Promise<Map<st
     result.set('1h', hourlyCandles);
   }
 
-  // For shorter timeframes, use 30m data as baseline
+  // For shorter timeframes, use 30m data as baseline (not ideal but better than nothing)
+  result.set('15m', baseCandles.slice(0, 48));
   result.set('5m', baseCandles.slice(0, 60));
   result.set('1m', baseCandles.slice(0, 60));
 
-  console.log(`[Historical] Loaded candles: 30m=${result.get('30m')?.length || 0}, 1h=${result.get('1h')?.length || 0}`);
+  console.log(`[Historical] Loaded candles: 15m=${result.get('15m')?.length || 0}, 30m=${result.get('30m')?.length || 0}, 1h=${result.get('1h')?.length || 0}`);
 
   return result;
 }

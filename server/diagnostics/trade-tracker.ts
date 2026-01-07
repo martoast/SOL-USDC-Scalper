@@ -230,6 +230,14 @@ export function stopTrackingTrade(
   // Store in completed cache
   completedDiagnostics.set(tradeId, diagnostics);
 
+  // Limit completed diagnostics to prevent unbounded memory growth (keep last 500)
+  if (completedDiagnostics.size > 500) {
+    const keysToDelete = Array.from(completedDiagnostics.keys()).slice(0, completedDiagnostics.size - 500);
+    for (const key of keysToDelete) {
+      completedDiagnostics.delete(key);
+    }
+  }
+
   // Remove from active trackers
   activeTrackers.delete(tradeId);
 

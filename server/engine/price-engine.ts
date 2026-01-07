@@ -9,7 +9,7 @@
 import { WSConnection } from './ws-connection';
 import { PoolSubscriber } from './pool-subscriber';
 import { eventBus, EVENTS, type PriceUpdate } from './event-bus';
-import { updatePrice, resetCandles, loadHistoricalCandles, loadAllHistoricalCandles } from '../utils/sol-candles';
+import { updatePrice, resetCandles, loadHistoricalCandles, loadAllHistoricalCandles, getLastPrice } from '../utils/sol-candles';
 import { fetchAllHistoricalCandles, buildDerivedCandles } from '../utils/historical-candles';
 
 export class PriceEngine {
@@ -79,6 +79,13 @@ export class PriceEngine {
 
       // Load all candles into storage
       loadAllHistoricalCandles(candleMap);
+
+      // Set initial price from historical data so UI doesn't show 0
+      const historicalPrice = getLastPrice();
+      if (historicalPrice > 0) {
+        this.stats.lastPrice = historicalPrice;
+        console.log(`[PriceEngine] 💰 Initial price from history: $${historicalPrice.toFixed(4)}`);
+      }
 
       console.log('[PriceEngine] ✅ Historical data loaded - indicators ready!');
 
